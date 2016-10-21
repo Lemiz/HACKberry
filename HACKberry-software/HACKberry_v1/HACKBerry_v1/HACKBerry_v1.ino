@@ -3,6 +3,10 @@
  * Re-code of the firmware for the exii hackberry hand.
  * This recode brings a better signal filtering, and removes the need for calibration.
  * It also uses 2 sensors to control the opening/closing of the hand.
+ * 
+ * Note: Most of the filtering code was to use the myoware sensors.
+ * Thing is, we ended up using the professional sensors from bionico's prosthetic which already have a very clear signal,
+ * thus rendering most of the filtering code useless...
  */
 
 #include <RunningMedian.h>
@@ -88,7 +92,7 @@ bool loopMyo(struct myo *m) {
   m->minDiffMedian.add(m->shortMedian.getMedian() - m->minimumThreshold);
 
   // Edges detection
-  if (m->state == MYO_IDLE && m->diffMedian.getMedian() > ACTIVE_EDGE_DETECTION) { // if the median of the difference between shortMedian and longMedian is over 10
+  if (m->state == MYO_IDLE && m->diffMedian.getMedian() > ACTIVE_EDGE_DETECTION) { // if the median of the difference between shortMedian and longMedian is over ACTIVE_EDGE_DETECTION
     m->state = MYO_ACTIVE;
     m->minimumThreshold = m->longMedian.getMedian();
     m->minDiffMedian.clear();
@@ -116,6 +120,8 @@ struct myo m1;
 struct myo m2;
 
 struct finger thumb;
+unsigned long lastThumbMove;
+
 struct finger index;
 struct finger middle;
 
@@ -126,13 +132,15 @@ struct finger middle;
 void setup() {
   pinMode(7, INPUT);
   digitalWrite(7, HIGH);
+
+  lastThumbMove = millis();
   
   setupMyo(&m1, A0);
   setupMyo(&m2, A6);
 
   setupFinger(&thumb, 6, 60, 158);
-  setupFinger(&index, 3, 27, 150);
-  setupFinger(&middle, 5, 35, 150);
+  setupFinger(&index, 3, 0, 180);
+  setupFinger(&middle, 5, 0, 180);
 
   Serial.begin(115200);
 }
@@ -144,22 +152,27 @@ void loop() {
   }
 
   // if a sensor turns active, set the other one to MYO_IDLE
-  if (loopMyo(&m1)) {
-    m2.state = MYO_IDLE;
-  }
-  if (loopMyo(&m2)) {
-    m1.state = MYO_IDLE;
-  }
+  loopMyo(&m1);
+  loopMyo(&m2);
 
-  // update servos angles
-  if (m1.state == MYO_ACTIVE) {
-    index.angle += m1.minDiffMedian.getMedian() / 700;
-    middle.angle = map(index.angle, index.min, index.max, middle.max, middle.min);
-  }
-
-  if (m2.state == MYO_ACTIVE) {
-    index.angle -= m2.minDiffMedian.getMedian() / 700;
-    middle.angle = map(index.angle, index.min, index.max, middle.max, middle.min);
+  // both sensors at once and a difference < 20%: thumb control
+  if (m1.state == MYO_ACTIVE && m2.state == MYO_ACTIVE &&
+      fabs(m1.minDiffMedian.getMedian() - m2.minDiffMedian.getMedian()) < max(m1.minDiffMedian.getMedian(), m2.minDiffMedian.getMedian()) / 5) {
+    if (millis() - lastThumbMove > 2000) {
+      thumb.angle = thumb.angle == thumb.min ? thumb.max : thumb.min;
+      lastThumbMove = millis();
+    }
+  } else {
+    // update servos angles
+    if ((m1.state == MYO_ACTIVE && m2.state == MYO_IDLE) || (m1.state == MYO_ACTIVE && m2.state == MYO_ACTIVE && m1.minDiffMedian.getMedian() > m2.minDiffMedian.getMedian())) {
+      index.angle += m1.minDiffMedian.getMedian() / 300;
+      middle.angle = map(index.angle, index.min, index.max, middle.min, middle.max);
+    }
+  
+    if ((m2.state == MYO_ACTIVE && m1.state == MYO_IDLE) || (m2.state == MYO_ACTIVE && m1.state == MYO_ACTIVE && m2.minDiffMedian.getMedian() > m1.minDiffMedian.getMedian())) {
+      index.angle -= m2.minDiffMedian.getMedian() / 300;
+      middle.angle = map(index.angle, index.min, index.max, middle.min, middle.max);
+    }
   }
 
   // Finger loop functions
