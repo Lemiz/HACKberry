@@ -1,270 +1,180 @@
-/*---------------------------------------------
-  HACKberryプログラム
-  exiii Inc. 小笠原佑樹
-  最終更新日：2016/8/22
 
-  Board:Arduino/Genuino Micro
-  Programmer:AVRISP mkⅡ
-  ---------------------------------------------*/
+/**
+ * Re-code of the firmware for the exii hackberry hand.
+ * This recode brings a better signal filtering, and removes the need for calibration.
+ * It also uses 2 sensors to control the opening/closing of the hand.
+ */
 
+#include <RunningMedian.h>
 #include <Servo.h>
 
-//Motor angle setting
-#define thumbExtend   158
-#define thumbPinch    60
-#define IndexExtend   150   //extend
-#define IndexFlex     27    //flex
-#define middleExtend  102   //extend
-#define middleFlex    35    //flex
+// RunningMedia configuration
+#define MEDIAN_MAX_SIZE     41
 
-const int calibPin0     = A6;   //For calibration
-//const int calibPin1     = A5;  //not in use
-const int thumbPin      = A4;   //change the thumb position among two preset values
-const int fingerPin     = A3;   //lock or unlock the position of middle finger, ring finger and pinky
-const int analogInPin0  = A0;   //sensor input
+// Magic numbers configuration
+#define ACTIVE_EDGE_DETECTION 10 // if the sensor is idle and a difference greater than this value is detected, switch to MYO_ACTIVE state
+#define IDLE_EDGE_DETECTION 15   // if the sensor is active and its value goes back to its (pre-active value + 15) or lower, switch back to MYO_IDLE state
+#define SERVO_TICK_MS 15         // servo value update cycle
 
-float target = 0;
-boolean thumbPinState   = 1;
-boolean fingerPinState  = 1;
+// tick counter
+unsigned long counter = 0;
 
-int swCount0    = 0;  //キャリブスイッチ用カウント変数
-//int swCount1    = 0;  //未使用
-int swCount2    = 0;  //ThumbPinの入力時に使うカウント用変数
-int swCount3    = 0;  //FingerPinの入力時に使うカウント用変数
-int swCountThr  = 6;
+/**
+ * Fingers structure and functions
+ */
 
-int sensorValue = 0;  // value read from the sensor
-int sensorMax   = 700;
-int sensorMin   = 0;
-int threshold   = 0;
+struct finger {
+  Servo servo;
+  float min;
+  float max;
 
-//speed settings
-int speedMax  = 7;
-int speedMin  = 0;
-int speedRev  = -3;
-int speed     = 0;
+  float angle;
+  RunningMedian median = RunningMedian(3);
 
-int positionMax = 150;
-int positionMin = 0;
-int position    = 0;
-int prePosition = 0;
+  unsigned long lastUpdate;
+};
 
-int thumbPos  = 90;
-int indexPos  = 90;
-int middlePos = 90;
+void setupFinger(struct finger *f, int pin, float min, float max) {
+  f->servo.attach(pin);
+  f->min = min;
+  f->max = max;
+  f->angle = min + (max - min) / 2;
+  f->lastUpdate = millis();
+}
 
-int sensorMin_temp;   //キャリブレーション関数で使用
+void loopFinger(struct finger *f) {
+  f->angle = min(f->max, max(f->min, f->angle));  // limit values between min/max for this servo
+  f->median.add(f->angle);                        // servo angle smooth filtering
 
-Servo myservo0;   //controls index finger
-Servo myservo1;   //controls middle finger, ring finger and pinky
-Servo myservo2;   //controls thumb
+  if (millis() - f->lastUpdate > SERVO_TICK_MS) { // update servo value, every SERVO_TICK_MS ms
+    f->lastUpdate = millis();
+    f->servo.write(f->median.getAverage());
+  }
+}
 
+/**
+ * Myo structure and functions
+ */
+
+#define MYO_IDLE 0
+#define MYO_ACTIVE 1
+
+struct myo {
+  RunningMedian shortMedian = RunningMedian(41);   // short term filtering
+  RunningMedian longMedian = RunningMedian(3);     // long term filtering, used as a reference, to detect changes
+  RunningMedian diffMedian = RunningMedian(21);    // used to to do the median of the difference between shortMedian and longMedian
+  RunningMedian minDiffMedian = RunningMedian(21); // used to to do the median of the difference between shortMedian and minimumThreshold, to detect the return to normal
+
+  int state;                                       // holds the current state for the myo, either MYO_IDLE or MYO_ACTIVE
+  int pin;                                         // analog pin to read the sensor value
+  float minimumThreshold;                          // holds the value used as reference for the return to normal, calculated when state goes to MYO_ACTIVE
+};
+
+void setupMyo(struct myo *m, int pin) {
+  m->pin = pin;
+}
+
+/**
+ * This function updates the state of a myo
+ * multiple layers of filtering are used to detect changes of intensity and return to normal
+ */
+bool loopMyo(struct myo *m) {
+  // update all median filtering calculations
+  m->shortMedian.add(analogRead(m->pin));
+  if (counter % 10 == 0) {
+    m->longMedian.add(m->shortMedian.getMedian());
+  }
+  m->diffMedian.add(m->shortMedian.getMedian() - m->longMedian.getMedian());
+  m->minDiffMedian.add(m->shortMedian.getMedian() - m->minimumThreshold);
+
+  // Edges detection
+  if (m->state == MYO_IDLE && m->diffMedian.getMedian() > ACTIVE_EDGE_DETECTION) { // if the median of the difference between shortMedian and longMedian is over 10
+    m->state = MYO_ACTIVE;
+    m->minimumThreshold = m->longMedian.getMedian();
+    m->minDiffMedian.clear();
+    m->minDiffMedian.add(ACTIVE_EDGE_DETECTION);
+    return true;
+  } else if (m->state == MYO_ACTIVE && m->minDiffMedian.getAverage() < IDLE_EDGE_DETECTION) {
+    m->state = MYO_IDLE;
+  }
+  return false;
+}
+
+void resetMyo(struct myo *m) {
+  m->state = MYO_IDLE;
+  m->minimumThreshold = 0;
+  m->shortMedian.clear();
+  m->longMedian.clear();
+  m->diffMedian.clear();
+  m->minDiffMedian.clear();
+}
+
+/**
+ * State variable holders
+ */
+struct myo m1;
+struct myo m2;
+
+struct finger thumb;
+struct finger index;
+struct finger middle;
+
+/**
+ * Arduino standard functions
+ */
 
 void setup() {
+  pinMode(7, INPUT);
+  digitalWrite(7, HIGH);
   
-  Serial.begin(9600);
+  setupMyo(&m1, A0);
+  setupMyo(&m2, A6);
 
-  pinMode(calibPin0, INPUT);
-  digitalWrite(calibPin0, HIGH);
+  setupFinger(&thumb, 6, 60, 158);
+  setupFinger(&index, 3, 27, 150);
+  setupFinger(&middle, 5, 35, 150);
 
-  pinMode(thumbPin, INPUT);
-  digitalWrite(thumbPin, HIGH);
-
-  pinMode(fingerPin, INPUT);
-  digitalWrite(fingerPin, HIGH);
-
-  myservo0.attach(3); //index
-  myservo1.attach(5); //middle
-  myservo2.attach(6); //thumb
-
+  Serial.begin(115200);
 }
-
 
 void loop() {
-
-  //初期のキャリブレーション処理
-  while (1) {
-    myservo0.write(IndexExtend);    //indexサーボを初期位置にする。
-    myservo1.write(middleExtend);   //middleサーボを初期位置にする。
-    myservo2.write(thumbExtend);    //Thumb open
-    Serial.println("Waiting for Calibration...");
-    delay(10);
-    if (digitalRead(calibPin0) == LOW) {
-      calibration();
-      break;
-    }
+  if (digitalRead(7) == LOW) {
+    resetMyo(&m1);
+    resetMyo(&m2);
   }
 
-  while (1) { //通常動作ループ
-
-    sensorValue = ReadSens_and_Condition();
-    delay(25);
-
-    if (digitalRead(calibPin0) == LOW) swCount0 += 1;
-    else swCount0 = 0;
-
-    if (swCount0 == swCountThr) {
-      swCount0 = 0;
-      calibration();
-    }
-
-    if (digitalRead(thumbPin) == LOW) swCount2 += 1;
-    else swCount2 = 0;
-
-    if (swCount2 == swCountThr) {
-      swCount2 = 0;
-      thumbPinState = !thumbPinState;
-      while (digitalRead(thumbPin) == LOW) {
-        delay(1);
-      }
-    }
-
-    if (digitalRead(fingerPin) == LOW) swCount3 += 1;
-    else swCount3 = 0;
-
-    if (swCount3 == swCountThr) {
-      swCount3 = 0;
-      fingerPinState = !fingerPinState;
-      while (digitalRead(fingerPin) == LOW) {
-        delay(1);
-      }
-    }
-
-    //status
-    Serial.print("Min=");
-    Serial.print(sensorMin);
-    Serial.print(",Max=");
-    Serial.print(sensorMax);
-    Serial.print(",Value=");
-    Serial.print(sensorValue);
-    Serial.print(",thumb=");
-    Serial.print(thumbPinState);
-    Serial.print(",finger=");
-    Serial.print(fingerPinState);
-    Serial.print(",indexPos=");
-    Serial.print(indexPos);
-    Serial.print(",thumb=");
-    Serial.print(swCount3);
-    Serial.print(",speed=");
-    Serial.print(speed);
-
-    Serial.print(",thumbPinState=");
-    Serial.print(thumbPinState);
-    Serial.print(",fingerPinState=");
-    Serial.println(fingerPinState);
-
-    //calculate speed
-    if (sensorValue < (sensorMin + (sensorMax - sensorMin) / 8)) speed = speedRev;
-    else if (sensorValue < (sensorMin + (sensorMax - sensorMin) / 4)) speed = 0;
-    else speed = map(sensorValue, sensorMin, sensorMax, speedMin, speedMax);
-
-    //calculate position
-    position = prePosition + speed;
-    if (position < positionMin) position = positionMin;
-    if (position > positionMax) position = positionMax;
-    prePosition = position;
-    //motor
-    indexPos = map(position, positionMin, positionMax, IndexExtend, IndexFlex);
-    myservo0.write(indexPos);
-
-    //三指のスイッチ・オン状態だったらサーボを動かす。それ以外は動かない。
-    if (fingerPinState == HIGH) {
-      middlePos = map(position, positionMin, positionMax, middleExtend, middleFlex);
-      myservo1.write(middlePos);
-    }
-
-    //親指の駆動
-    switch (thumbPinState) {
-      case 0://pinch
-        myservo2.write(thumbPinch);
-        break;
-      case 1://open
-        myservo2.write(thumbExtend);
-        break;
-      default:
-        break;
-    }
-  
-  } //while
-}   //Main loop
-
-
-//以下各種関数群
-
-//センサ読み取り
-int ReadSens_and_Condition() {
-  
-  int i;
-  int sval;
-  for (i = 0; i < 20; i++) {
-    sval = sval + abs(1023 - analogRead(analogInPin0)); //for SensorBoard_v1_1
+  // if a sensor turns active, set the other one to MYO_IDLE
+  if (loopMyo(&m1)) {
+    m2.state = MYO_IDLE;
   }
-  sval = sval / 20;
-  return sval;
-  
-}
+  if (loopMyo(&m2)) {
+    m1.state = MYO_IDLE;
+  }
 
-//センサ入力範囲キャリブレーション
-void calibration() {
+  // update servos angles
+  if (m1.state == MYO_ACTIVE) {
+    index.angle += m1.minDiffMedian.getMedian() / 700;
+    middle.angle = map(index.angle, index.min, index.max, middle.max, middle.min);
+  }
 
-  myservo0.write(IndexExtend);  //indexサーボを初期位置にする。
-  myservo1.write(middleFlex);   //middleサーボを初期位置にする。
-  myservo2.write(thumbExtend);  //Thumb open
+  if (m2.state == MYO_ACTIVE) {
+    index.angle -= m2.minDiffMedian.getMedian() / 700;
+    middle.angle = map(index.angle, index.min, index.max, middle.max, middle.min);
+  }
 
-  Serial.println("please wait...");
-  delay(500);
-  Serial.println("start");
+  // Finger loop functions
+  loopFinger(&thumb);
+  loopFinger(&index);
+  loopFinger(&middle);
 
-  sensorMin = ReadSens_and_Condition();
-  sensorMax = sensorMin + 1;
-
-  unsigned long time = millis();
-
-  while ( millis() < time + 5000 ) {
-
-    //距離を取得
-    sensorValue = ReadSens_and_Condition();
-    delay(25);
-
-    //最大値最小値の更新
-    if ( sensorValue < sensorMin ) {
-      sensorMin = sensorValue;
-      sensorMin_temp = sensorMin + (sensorMax - sensorMin) / 4;
-    }
-    else if ( sensorValue > sensorMax )sensorMax = sensorValue;
-    else;
-
-    //calculate speed
-    if (sensorValue < (sensorMin_temp + (sensorMax - sensorMin) / 8)) speed = speedRev;
-    else if (sensorValue < (sensorMin_temp + (sensorMax - sensorMin) / 4)) speed = 0;
-    else speed = map(sensorValue, sensorMin_temp, sensorMax, speedMin, speedMax);
-
-    //calculate position
-    position = prePosition + speed;
-    if (position < positionMin) position = positionMin;
-    if (position > positionMax) position = positionMax;
-    prePosition = position;
-    //motor
-    indexPos = map(position, positionMin, positionMax, IndexExtend, IndexFlex);
-    myservo0.write(indexPos);
-
-    Serial.print("Min=");
-    Serial.print(sensorMin);
-    Serial.print(",Min_temp=");
-    Serial.print(sensorMin_temp);
-    Serial.print(",Max=");
-    Serial.print(sensorMax);
-    Serial.print(",Value=");
-    Serial.print(sensorValue);
-    Serial.print(",time=");
-    Serial.print(time);
-    Serial.print(",millis=");
-    Serial.print(millis());
-    Serial.print("Button=");
-    Serial.println(digitalRead(calibPin0));
-
-  } //while
-  
-  sensorMin += (sensorMax - sensorMin) / 4;
-
+  Serial.print(m1.shortMedian.getMedian());
+  Serial.print(", ");
+  Serial.print(m1.minimumThreshold);
+  Serial.print(", ");
+  Serial.print(m2.shortMedian.getMedian());
+  Serial.print(", ");
+  Serial.print(m2.minimumThreshold);
+  //Serial.print(index.median.getMedian());
+  Serial.println();
+  ++counter;
 }
